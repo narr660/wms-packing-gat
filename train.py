@@ -4,12 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pickle
-import sys
 
 def train(work_dir, epochs=200, lr=0.001):
     from gat_model import MixedLoadGAT, ContrastiveLoss, build_graph, make_pairs
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"디바이스: {device}", flush=True)
 
     with open(f"{work_dir}/data/rs_labeled.pkl", "rb") as f:
         rs_labeled = pickle.load(f)
@@ -19,6 +19,9 @@ def train(work_dir, epochs=200, lr=0.001):
     criterion = ContrastiveLoss(margin=1.0)
 
     best_loss = float("inf")
+
+    print("학습 시작...", flush=True)
+    print("="*50, flush=True)
 
     for epoch in range(epochs):
         model.train()
@@ -47,7 +50,6 @@ def train(work_dir, epochs=200, lr=0.001):
                     epoch_forbidden_dist += dist[forbidden_mask].mean().item()
                 if possible_mask.sum() > 0:
                     epoch_possible_dist += dist[possible_mask].mean().item()
-
             n_batches += 1
 
         avg_loss      = epoch_loss / n_batches
@@ -59,12 +61,14 @@ def train(work_dir, epochs=200, lr=0.001):
             torch.save(model.state_dict(),
                        f"{work_dir}/checkpoints/gat_best.pt")
 
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1:3d}/{epochs} | "
                   f"Loss: {avg_loss:.4f} | "
                   f"금지: {avg_forbidden:.4f} | "
                   f"가능: {avg_possible:.4f} | "
-                  f"차이: {avg_forbidden - avg_possible:.4f}")
+                  f"차이: {avg_forbidden - avg_possible:.4f}",
+                  flush=True)
 
-    print(f"학습 완료 | Best Loss: {best_loss:.4f}")
+    print("="*50, flush=True)
+    print(f"학습 완료 | Best Loss: {best_loss:.4f}", flush=True)
     return model
