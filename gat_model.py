@@ -52,12 +52,14 @@ def build_graph(sequence):
     )
 
 class MixedLoadGAT(nn.Module):
-    def __init__(self, in_channels=5, hidden_channels=64,
+    def __init__(self, in_channels=5, hidden_channels=128,
                  out_channels=64, heads=4, dropout=0.1):
         super().__init__()
         self.conv1 = GATConv(in_channels, hidden_channels,
                               heads=heads, dropout=dropout)
-        self.conv2 = GATConv(hidden_channels * heads, out_channels,
+        self.conv2 = GATConv(hidden_channels * heads, hidden_channels,
+                              heads=heads, dropout=dropout)
+        self.conv3 = GATConv(hidden_channels * heads, out_channels,
                               heads=1, concat=False, dropout=dropout)
         self.dropout = dropout
 
@@ -66,19 +68,28 @@ class MixedLoadGAT(nn.Module):
         x = F.elu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.conv2(x, edge_index)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.conv3(x, edge_index)
         x = F.normalize(x, p=2, dim=1)
         return x
 
 class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0):
+    def __init__(self, margin=1.0, pos_weight=3.0):
         super().__init__()
         self.margin = margin
+        self.pos_weight = pos_weight
 
     def forward(self, emb_i, emb_j, label):
         dist = F.pairwise_distance(emb_i, emb_j)
+        weight = torch.where(
+            label == 0,
+            torch.tensor(self.pos_weight).to(label.device),
+            torch.tensor(1.0).to(label.device)
+        )
         loss_pos = label * dist.pow(2)
         loss_neg = (1 - label) * F.relu(self.margin - dist).pow(2)
-        return (loss_pos + loss_neg).mean(), dist.mean().item()
+        return (weight * (loss_pos + loss_neg)).mean(), dist.mean().item()
 
 def make_pairs(sequence, embeddings, device):
     pairs_i = []
