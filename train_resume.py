@@ -1,11 +1,10 @@
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pickle
 
-def train(work_dir, epochs=200, lr=0.01, margin=0.5):
+def train_resume(work_dir, epochs=150, lr=0.001, margin=1.0):
     from gat_model import MixedLoadGAT, ContrastiveLoss, build_graph, make_pairs
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -14,15 +13,19 @@ def train(work_dir, epochs=200, lr=0.01, margin=0.5):
     with open(f"{work_dir}/data/rs_labeled.pkl", "rb") as f:
         rs_labeled = pickle.load(f)
 
+    # Best Model 불러오기
     model = MixedLoadGAT().to(device)
+    model.load_state_dict(
+        torch.load(f"{work_dir}/checkpoints/gat_best.pt",
+                   map_location=device)
+    )
+    print("Best Model 로드 완료", flush=True)
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = ContrastiveLoss(margin=margin)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10
-    )
 
     best_loss = float("inf")
-    print(f"학습 시작 (lr={lr}, margin={margin})...", flush=True)
+    print(f"이어서 학습 시작 (lr={lr}, margin={margin})...", flush=True)
     print("="*50, flush=True)
 
     for epoch in range(epochs):
@@ -58,21 +61,17 @@ def train(work_dir, epochs=200, lr=0.01, margin=0.5):
         avg_forbidden = epoch_forbidden_dist / n_batches
         avg_possible  = epoch_possible_dist / n_batches
 
-        scheduler.step(avg_loss)
-
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(),
                        f"{work_dir}/checkpoints/gat_best.pt")
 
         if (epoch + 1) % 5 == 0:
-            current_lr = optimizer.param_groups[0]["lr"]
             print(f"Epoch {epoch+1:3d}/{epochs} | "
                   f"Loss: {avg_loss:.4f} | "
                   f"금지: {avg_forbidden:.4f} | "
                   f"가능: {avg_possible:.4f} | "
-                  f"차이: {avg_forbidden - avg_possible:.4f} | "
-                  f"lr: {current_lr:.5f}",
+                  f"차이: {avg_forbidden - avg_possible:.4f}",
                   flush=True)
 
     print("="*50, flush=True)
