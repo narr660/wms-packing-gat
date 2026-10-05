@@ -45,7 +45,7 @@ def build_graph_safe(sequence):
 class EMSManager:
     """
     GOPT 방식 Extreme Point Set 관리
-    아이템 배치 후 극단점 업데이트
+    겹침 체크 + 중력 적용
     """
     def __init__(self, bin_W, bin_H, bin_D):
         self.bin_W = bin_W
@@ -54,50 +54,48 @@ class EMSManager:
         self.reset()
 
     def reset(self):
-        # 초기 극단점: 박스 원점
         self.ems = [(0, 0, 0)]
-        self.placed_items = []  # (x, y, z, w, h, d)
+        self.placed_items = []
+        self.used_volume  = 0
 
-    def _is_valid_point(self, x, y, z):
-        """박스 범위 내 유효한 점인지 확인"""
-        return (0 <= x < self.bin_W and
-                0 <= y < self.bin_H and
-                0 <= z < self.bin_D)
+    def _is_overlapping(self, x, y, z, w, h, d):
+        for px, py, pz, pw, ph, pd in self.placed_items:
+            if (x < px + pw and x + w > px and
+                y < py + ph and y + h > py and
+                z < pz + pd and z + d > pz):
+                return True
+        return False
 
-    def _get_height_at(self, x, z, w, d):
-        """특정 위치에서 현재 높이 계산"""
+    def _get_support_height(self, x, z, w, d):
         max_h = 0
         for px, py, pz, pw, ph, pd in self.placed_items:
-            # x축 겹침
-            if px < x + w and px + pw > x:
-                # z축 겹침
-                if pz < z + d and pz + pd > z:
-                    max_h = max(max_h, py + ph)
+            if (px < x + w and px + pw > x and
+                pz < z + d and pz + pd > z):
+                max_h = max(max_h, py + ph)
         return max_h
 
     def can_place(self, item):
-        """
-        GOPT EMS 방식: 극단점에서 배치 가능 여부 확인
-        가장 낮은 극단점 반환
-        """
         w, h, d = item["size"]
-        best_ep = None
+        if w > self.bin_W or h > self.bin_H or d > self.bin_D:
+            return None
+
+        best_ep    = None
         best_score = float("inf")
 
         for ex, ey, ez in self.ems:
-            # 박스 범위 체크
             if ex + w > self.bin_W or ez + d > self.bin_D:
                 continue
 
-            # 실제 배치 높이 계산
-            floor_h = self._get_height_at(ex, ez, w, d)
+            floor_h = self._get_support_height(ex, ez, w, d)
             place_y = floor_h
 
             if place_y + h > self.bin_H:
                 continue
 
-            # 안정성 체크 (바닥 또는 기존 아이템 위)
-            score = place_y * 100 + ex + ez  # 낮고 왼쪽 앞이 우선
+            if self._is_overlapping(ex, place_y, ez, w, h, d):
+                continue
+
+            score = place_y * 1000 + ex * 10 + ez
             if score < best_score:
                 best_score = score
                 best_ep = (ex, place_y, ez)
@@ -105,36 +103,33 @@ class EMSManager:
         return best_ep
 
     def place(self, item, pos):
-        """아이템 배치 후 EMS 업데이트"""
         w, h, d = item["size"]
         x, y, z = pos
-
         self.placed_items.append((x, y, z, w, h, d))
+        item_vol = w * h * d
+        self.used_volume += item_vol
 
-        # 새 극단점 생성
         new_eps = [
-            (x + w, y, z),   # 오른쪽
-            (x, y + h, z),   # 위쪽
-            (x, y, z + d),   # 앞쪽
+            (x + w, y, z),
+            (x, y + h, z),
+            (x, y, z + d),
         ]
-
-        # 유효한 극단점만 추가
         for ep in new_eps:
-            if self._is_valid_point(*ep):
+            ex, ey, ez = ep
+            if (0 <= ex <= self.bin_W and
+                0 <= ey <= self.bin_H and
+                0 <= ez <= self.bin_D):
                 self.ems.append(ep)
 
-        # 중복 제거
         self.ems = list(set(self.ems))
-
-        item_vol = w * h * d
         return item_vol
 
     def get_heightmap(self, bin_W, bin_D, bin_H):
-        """Height Map 반환 (관찰 공간용)"""
         hm = np.zeros((bin_W, bin_D), dtype=np.float32)
         for px, py, pz, pw, ph, pd in self.placed_items:
             hm[px:px+pw, pz:pz+pd] = np.maximum(
-                hm[px:px+pw, pz:pz+pd], (py + ph) / bin_H
+                hm[px:px+pw, pz:pz+pd],
+                (py + ph) / bin_H
             )
         return hm
 
@@ -145,7 +140,7 @@ class PackingEnvWithHold(gym.Env):
     Layer 1: GAT 임베딩 → 관찰 공간
     Layer 2: NSA Constraint Mask + CSA → GAT 업데이트
     Layer 3: Transformer + PPO → Pack/Hold/Close
-    배치: GOPT EMS 방식
+    배치: GOPT EMS 방식 (겹침 체크 + 중력)
     Hold: HEN 논문 방식 (K=3)
     """
     def __init__(self, gat_model, rs_labeled, device,
@@ -161,10 +156,8 @@ class PackingEnvWithHold(gym.Env):
         self.bin_volume       = bin_size[0] * bin_size[1] * bin_size[2]
         self.hold_buffer_size = hold_buffer_size
 
-        # GOPT EMS 관리자
         self.ems_manager = EMSManager(bin_size[0], bin_size[1], bin_size[2])
 
-        # Layer 2: NSA + CSA
         self.nsa = NSADetector(
             embedding_dim=64,
             num_detectors=nsa_detectors,
@@ -199,13 +192,10 @@ class PackingEnvWithHold(gym.Env):
         self.item_idx        = 0
         self.packed_items    = []
         self.hold_buffer     = []
-        self.used_volume     = 0.0
         self.violations      = 0
         self.total_packed    = 0
         self.all_embeddings  = []
         self.all_labels      = []
-
-        # EMS 초기화
         self.ems_manager.reset()
 
         return self._get_obs(), {}
@@ -268,7 +258,6 @@ class PackingEnvWithHold(gym.Env):
             pass
 
     def _get_obs(self):
-        # EMS Height Map
         hm = self.ems_manager.get_heightmap(
             self.bin_W, self.bin_D, self.bin_H
         ).flatten()
@@ -299,17 +288,6 @@ class PackingEnvWithHold(gym.Env):
 
         return np.concatenate([hm, item_feat, gat_feat, buf_feat]).astype(np.float32)
 
-    def _try_place(self, item):
-        """GOPT EMS 방식으로 배치 시도"""
-        pos = self.ems_manager.can_place(item)
-        if pos is None:
-            return False, 0.0
-        item_vol = self.ems_manager.place(item, pos)
-        self.used_volume  += item_vol
-        self.total_packed += 1
-        self.packed_items.append(item)
-        return True, item_vol / self.bin_volume
-
     def step(self, action):
         terminated = False
         truncated  = False
@@ -329,15 +307,19 @@ class PackingEnvWithHold(gym.Env):
                 self.violations += 1
                 self._collect_embedding(0)
             else:
-                placed, uti_gain = self._try_place(current_item)
-                if not placed:
-                    reward = -0.2  # 공간 없음
+                pos = self.ems_manager.can_place(current_item)
+                if pos is None:
+                    reward = -0.2
                 else:
+                    item_vol = self.ems_manager.place(current_item, pos)
+                    uti_gain = item_vol / self.bin_volume
                     reward = 0.6 * uti_gain + 0.04
+                    self.total_packed += 1
+                    self.packed_items.append(current_item)
                 self._collect_embedding(1)
             self.item_idx += 1
 
-        elif action == 1:  # Hold (HEN 방식)
+        elif action == 1:  # Hold
             if len(self.hold_buffer) < self.hold_buffer_size:
                 self.hold_buffer.append(current_item)
                 reward = -0.05
@@ -347,20 +329,24 @@ class PackingEnvWithHold(gym.Env):
                     self.violations += 1
                     self._collect_embedding(0)
                 else:
-                    placed, uti_gain = self._try_place(current_item)
-                    if not placed:
+                    pos = self.ems_manager.can_place(current_item)
+                    if pos is None:
                         reward = -0.2
                     else:
+                        item_vol = self.ems_manager.place(current_item, pos)
+                        uti_gain = item_vol / self.bin_volume
                         reward = 0.6 * uti_gain
+                        self.total_packed += 1
+                        self.packed_items.append(current_item)
                     self._collect_embedding(1)
             self.item_idx += 1
 
-        elif action == 2:  # Close (새 박스)
+        elif action == 2:  # Close
             reward = -0.1
             self.ems_manager.reset()
             self.packed_items = []
 
-        elif action >= 3:  # Unhold (HEN 방식)
+        elif action >= 3:  # Unhold
             buf_idx = action - 3
             if buf_idx < len(self.hold_buffer):
                 buf_item = self.hold_buffer[buf_idx]
@@ -368,18 +354,23 @@ class PackingEnvWithHold(gym.Env):
                     reward = -1.0
                     self.violations += 1
                 else:
-                    placed, uti_gain = self._try_place(buf_item)
-                    if not placed:
+                    pos = self.ems_manager.can_place(buf_item)
+                    if pos is None:
                         reward = -0.2
                     else:
+                        item_vol = self.ems_manager.place(buf_item, pos)
+                        uti_gain = item_vol / self.bin_volume
                         reward = 0.6 * uti_gain + 0.08
+                        self.total_packed += 1
+                        self.packed_items.append(buf_item)
                 self.hold_buffer.pop(buf_idx)
             else:
                 reward = -0.1
 
         if self.item_idx >= len(self.sequence):
             terminated = True
-            final_uti = self.used_volume / self.bin_volume
+            final_uti = self.ems_manager.used_volume / self.bin_volume
+            final_uti = min(final_uti, 1.0)  # 안전 클리핑
             violation_rate = self.violations / max(1, self.total_packed)
             compliance_rate = 1.0 - violation_rate
             reward += 0.6 * final_uti + 0.4 * compliance_rate
